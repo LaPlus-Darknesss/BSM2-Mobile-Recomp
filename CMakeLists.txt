@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.20)
+project(BSM2MobilePrototype C CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_subdirectory(vendor/androidrecomp)
+target_sources(androidrecomp PRIVATE bsm_platform.cpp bsm_audio.cpp bsm_music.cpp bsm_cursor.cpp bsm_random.cpp bsm_libc.cpp)
+target_include_directories(androidrecomp PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+if(TARGET arc_boot)
+  file(GLOB BSM_GENERATED CONFIGURE_DEPENDS "${ARC_LIFTED_DIR}/*.c")
+  set_property(TARGET arc_boot PROPERTY SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/bsm_host.cpp" ${BSM_GENERATED})
+  set_target_properties(arc_boot PROPERTIES OUTPUT_NAME bsm2_mobile)
+  if(MSVC)
+    # Keep the instruction helpers inline, but do not inline whole translated
+    # guest functions into one another across the large generated shards.
+    target_compile_options(arc_boot PRIVATE /w /bigobj /O2 /Ob1)
+  endif()
+endif()

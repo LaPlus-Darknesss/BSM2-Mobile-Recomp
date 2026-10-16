@@ -1,0 +1,766 @@
+// POSIX threads, semaphores and thread-local keys for the engine.
+//
+// The engine allocates `pthread_mutex_t`, `pthread_cond_t` and friends inline
+// inside its own structures, sized by Bionic's headers at the time it was
+// compiled. We cannot change those sizes, and guessing them wrong is silent
+// memory corruption rather than a crash.
+//
+// So we never depend on them. Every pthread call routes through this file, so
+// the guest never inspects the bytes itself -- which means the storage is
+// opaque and we only have to *fit inside* it, not match its layout. Each
+// object holds a single 32-bit id naming an entry in a registry here. The
+// smallest of Bionic's types is `pthread_once_t` at four bytes, so a `uint32_t`
+// fits every one of them with room to spare, on every host, with no NDK
+// headers required to prove it.
+//
+// Zero means "not created yet". That is not an accident of ours: Bionic's
+// PTHREAD_MUTEX_INITIALIZER is static zeroes, so a statically initialised mutex
+// legitimately arrives here having never been through pthread_mutex_init.
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <thread>
+#include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
+#include "arm64_context.h"
+#include "shim.h"
+
+namespace arc {
+namespace {
+
+// ponytail: one lock over every registry. Each mutex_lock briefly serialises
+// here, which is a real throughput ceiling for a game. Shard by id, or add a
+// lock-free fast path for the already-created case, if profiling says so.
+std::mutex g_registry;
+uint32_t g_next_id = 1;
+
+template <typename T>
+struct Registry {
+  // std::map, not unordered_map: references to elements stay valid across
+  // inserts, so a holder can keep using its object while another thread
+  // creates one.
+  std::map<uint32_t, std::unique_ptr<T>> items;
+
+  T* Obtain(uint32_t* slot) {
+    std::lock_guard<std::mutex> g(g_registry);
+    if (*slot == 0) {
+      *slot = g_next_id++;
+      items[*slot] = std::make_unique<T>();
+    }
+    auto it = items.find(*slot);
+    return it == items.end() ? nullptr : it->second.get();
+  }
+
+  T* Find(uint32_t id) {
+    std::lock_guard<std::mutex> g(g_registry);
+    auto it = items.find(id);
+    return it == items.end() ? nullptr : it->second.get();
+  }
+
+  void Release(uint32_t* slot) {
+    std::lock_guard<std::mutex> g(g_registry);
+    items.erase(*slot);
+    *slot = 0;
+  }
+};
+
+// --- mutexes ---------------------------------------------------------------
+// ponytail: every mutex is recursive, whatever type the guest asked for.
+// Recursive is strictly more permissive than normal -- code that is correct
+// under PTHREAD_MUTEX_NORMAL is still correct here; it just no longer
+// self-deadlocks. Split by type only if we ever want to reproduce a deadlock.
+Registry<std::recursive_mutex> g_mutexes;
+Registry<std::condition_variable_any> g_conds;
+Registry<std::shared_mutex> g_rwlocks;
+
+struct Semaphore {
+  std::mutex m;
+  std::condition_variable cv;
+  unsigned count = 0;
+};
+Registry<Semaphore> g_semaphores;
+
+// A guest thread is not a std::thread running a host function. Its entry point
+// is a guest address, so it has to be dispatched with a context and a stack of
+// its own -- and the host thread it runs on needs a large stack, because lifted
+// functions call one another as ordinary C functions and the guest's call depth
+// is the host's.
+constexpr size_t kGuestThreadStack = 16 * 1024 * 1024;
+constexpr size_t kGuestThreadHeadroom = 1 * 1024 * 1024;
+constexpr size_t kHostThreadStack = 256u << 20;
+
+// How many guest threads are alive, and the ceiling on that.
+//
+// A real system has one: pthread_create answers EAGAIN when a process asks
+// for more than it may have. A host with no ceiling instead gives a runaway
+// everything it asks for, and the first thing to notice is the machine
+// rather than the port -- which is not a diagnosis anyone can act on.
+//
+// It is a backstop, not a policy, and the number is deliberately far above
+// what any title needs: a guest that reaches it aborts, because the NDK's
+// std::thread turns EAGAIN into an exception nothing catches, so a ceiling
+// low enough to be tidy would kill runs that were working. Set
+// ARC_MAX_THREADS lower to find out *which* function is asking, together
+// with ARC_TRACE_THREADS; leave it alone otherwise.
+std::atomic<long> g_live_threads{0};
+std::atomic<long> g_threads_made{0};
+const std::chrono::steady_clock::time_point g_first_thread =
+    std::chrono::steady_clock::now();
+
+long GuestThreadCeiling() {
+  static const long limit = [] {
+    const char* s = getenv("ARC_MAX_THREADS");
+    const long v = s ? strtol(s, nullptr, 10) : 0;
+    // Two thousand. Measured rather than chosen: this host stopped being able
+    // to start threads at all somewhere past ten thousand, and by then every
+    // other program on it was in trouble too -- including the tools looking
+    // at the problem. A guest that aborts with the message above is a bug
+    // report; a machine that cannot fork is not.
+    return v > 0 ? v : 2048;
+  }();
+  return limit;
+}
+
+
+struct Thread {
+#if defined(_WIN32)
+  void* handle = nullptr;
+#else
+  pthread_t handle{};
+  bool started = false;
+#endif
+  void* result = nullptr;
+  bool detached = false;
+};
+Registry<Thread> g_threads;
+std::mutex g_active_lock;
+std::map<unsigned,Arm64Ctx*> g_active;
+
+struct Attr {
+  int detach_state = 0;
+  size_t stack_size = 0;
+};
+Registry<Attr> g_attrs;
+
+// --- thread-local keys -----------------------------------------------------
+struct KeyTable {
+  std::vector<void*> values;
+};
+thread_local KeyTable t_keys;
+std::atomic<uint32_t> g_next_key{1};
+
+// Which rwlocks this thread holds for writing, so unlock knows which of
+// shared_mutex's two unlock calls to make. pthread has one unlock for both.
+thread_local std::vector<uint32_t> t_write_held;
+
+// Bionic's timespec on LP64.
+struct GuestTimespec {
+  int64_t tv_sec;
+  int64_t tv_nsec;
+};
+
+// The id the guest holds for the calling thread, so pthread_self() and
+// pthread_kill() have something to name.
+thread_local uint32_t t_self_id = 0;
+
+// --- entry points ----------------------------------------------------------
+
+int MutexInit(uint32_t* m, const void*) {
+  *m = 0;
+  g_mutexes.Obtain(m);
+  return 0;
+}
+int MutexDestroy(uint32_t* m) {
+  g_mutexes.Release(m);
+  return 0;
+}
+int MutexLock(uint32_t* m) {
+  if (auto* p = g_mutexes.Obtain(m)) p->lock();
+  return 0;
+}
+int MutexUnlock(uint32_t* m) {
+  if (auto* p = g_mutexes.Obtain(m)) p->unlock();
+  return 0;
+}
+int MutexTrylock(uint32_t* m) {
+  auto* p = g_mutexes.Obtain(m);
+  return (p && p->try_lock()) ? 0 : 16 /* EBUSY */;
+}
+int MutexattrInit(uint32_t* a) {
+  *a = 0;
+  return 0;
+}
+int MutexattrDestroy(uint32_t*) { return 0; }
+int MutexattrSettype(uint32_t*, int) { return 0; }  // see the note above
+
+int CondInit(uint32_t* c, const void*) {
+  *c = 0;
+  g_conds.Obtain(c);
+  return 0;
+}
+int CondDestroy(uint32_t* c) {
+  g_conds.Release(c);
+  return 0;
+}
+int CondSignal(uint32_t* c) {
+  if (auto* p = g_conds.Obtain(c)) p->notify_one();
+  return 0;
+}
+int CondBroadcast(uint32_t* c) {
+  if (auto* p = g_conds.Obtain(c)) p->notify_all();
+  return 0;
+}
+int CondWait(uint32_t* c, uint32_t* m) {
+  auto* cv = g_conds.Obtain(c);
+  auto* mu = g_mutexes.Obtain(m);
+  if (!cv || !mu) return 22 /* EINVAL */;
+  std::unique_lock<std::recursive_mutex> lk(*mu, std::adopt_lock);
+  cv->wait(lk);
+  lk.release();  // the guest still owns the lock on return
+  return 0;
+}
+int CondTimedwait(uint32_t* c, uint32_t* m, const GuestTimespec* abstime) {
+  auto* cv = g_conds.Obtain(c);
+  auto* mu = g_mutexes.Obtain(m);
+  if (!cv || !mu) return 22;
+  std::unique_lock<std::recursive_mutex> lk(*mu, std::adopt_lock);
+  // pthread's timeout is absolute against CLOCK_REALTIME. system_clock does
+  // not tick in nanoseconds on every host, so the deadline is cast to whatever
+  // resolution it does use.
+  const auto since_epoch = std::chrono::seconds(abstime->tv_sec) +
+                           std::chrono::nanoseconds(abstime->tv_nsec);
+  const auto deadline = std::chrono::system_clock::time_point(
+      std::chrono::duration_cast<std::chrono::system_clock::duration>(
+          since_epoch));
+  std::cv_status st = cv->wait_until(lk, deadline);
+  lk.release();
+  return st == std::cv_status::timeout ? 110 /* ETIMEDOUT */ : 0;
+}
+
+int RwlockInit(uint32_t* l, const void*) {
+  *l = 0;
+  g_rwlocks.Obtain(l);
+  return 0;
+}
+int RwlockDestroy(uint32_t* l) {
+  g_rwlocks.Release(l);
+  return 0;
+}
+int RwlockRdlock(uint32_t* l) {
+  if (auto* p = g_rwlocks.Obtain(l)) p->lock_shared();
+  return 0;
+}
+int RwlockWrlock(uint32_t* l) {
+  if (auto* p = g_rwlocks.Obtain(l)) {
+    p->lock();
+    t_write_held.push_back(*l);
+  }
+  return 0;
+}
+int RwlockUnlock(uint32_t* l) {
+  auto* p = g_rwlocks.Obtain(l);
+  if (!p) return 22;
+  auto it = std::find(t_write_held.begin(), t_write_held.end(), *l);
+  if (it != t_write_held.end()) {
+    t_write_held.erase(it);
+    p->unlock();
+  } else {
+    p->unlock_shared();
+  }
+  return 0;
+}
+
+// pthread_once_t is a bare int, so it holds the state machine directly rather
+// than a registry id: 0 = untouched, 1 = running, 2 = done.
+// The initialiser is guest code, so it is dispatched rather than called. A
+// guest function pointer invoked as a host one executes ARM instructions on an
+// x86 processor, which arrives as an access violation *on execute* -- a fault
+// that names an address inside the game's own image and looks for all the
+// world like a bad pointer in the guest, rather than like the host calling it
+// wrongly. Every shim entry point taking a callback has this hazard; a thread's
+// entry point already dispatches, and this is the same thing.
+int Once(uint32_t* control, uint64_t fn) {
+  uint32_t expected = 0;
+  auto* state = reinterpret_cast<std::atomic<uint32_t>*>(control);
+  if (state->compare_exchange_strong(expected, 1)) {
+    arc_call_guest(fn, nullptr, 0);
+    state->store(2);
+    return 0;
+  }
+  while (state->load() != 2) std::this_thread::yield();
+  return 0;
+}
+
+int KeyCreate(uint32_t* key, void (*)(void*)) {
+  *key = g_next_key.fetch_add(1);
+  return 0;
+}
+int KeyDelete(uint32_t) { return 0; }
+
+// Threads here are always joinable; nothing asks for a detached one and the
+// registry would keep its slot either way.
+int AttrGetdetachstate(const void*, int* state) {
+  if (state) *state = 0;  // PTHREAD_CREATE_JOINABLE
+  return 0;
+}
+void* Getspecific(uint32_t key) {
+  return key < t_keys.values.size() ? t_keys.values[key] : nullptr;
+}
+int Setspecific(uint32_t key, void* value) {
+  if (key >= t_keys.values.size()) t_keys.values.resize(key + 1, nullptr);
+  t_keys.values[key] = value;
+  return 0;
+}
+
+struct GuestThreadStart {
+  uint64_t entry;
+  uint64_t arg;
+  uint32_t id;
+  Thread* slot;
+};
+
+#if defined(_WIN32)
+// A guest thread had no fault handling at all. An access violation on one took
+// the whole process down with no report attached to it, which is the least
+// useful way a port can fail -- and it is where a title does its real work: the
+// HTTP client, the asset decoder and the audio mixer all run here, not on the
+// thread the entry points were called from. A fault reported badly on the main
+// thread was still reported; a fault here was only ever an exit code.
+//
+// The thread does not survive it -- there is nothing sensible to resume -- but
+// the process does, so the title reports the failure in its own terms and the
+// run can still be read to the end.
+int GuestThreadFault(EXCEPTION_POINTERS* ep, const Arm64Ctx* c, unsigned id) {
+  const unsigned long code = ep->ExceptionRecord->ExceptionCode;
+  unsigned long long at = 0;
+  const char* kind = "";
+  if (ep->ExceptionRecord->NumberParameters >= 2) {
+    at = ep->ExceptionRecord->ExceptionInformation[1];
+    switch (ep->ExceptionRecord->ExceptionInformation[0]) {
+      case 0: kind = "read"; break;
+      case 1: kind = "write"; break;
+      case 8: kind = "execute"; break;
+      default: break;
+    }
+  }
+  fprintf(stderr, "\nguest thread %u faulted: %#lx on %s of %#llx\n",
+          id, code, kind, at);
+  const size_t frames = arc_frame_count();
+  if (frames) {
+    fprintf(stderr, "  guest functions entered, most recent first:\n");
+    for (size_t i = 0; i < frames && i < 24; ++i) {
+      const unsigned long long packed = arc_frame_at(i);
+      fprintf(stderr, "    image %u +%#llx\n",
+              (unsigned)(packed >> 56), packed & 0x00FFFFFFFFFFFFFFull);
+    }
+  }
+  const size_t calls = arc_trace_count();
+  if (calls) {
+    fprintf(stderr, "  last calls out of the guest, most recent first:\n   ");
+    for (size_t i = 0; i < calls && i < 12; ++i) {
+      const char* what = arc_trace_at(i);
+      fprintf(stderr, " %s", what ? what : "?");
+    }
+    fprintf(stderr, "\n");
+  }
+  // The frame ring above is global and so is shared with every other thread,
+  // which makes it nearly useless here. The frame pointer is not: lifted code
+  // keeps ARM64's stp x29, x30 chain, so this thread's own stack can be walked
+  // out of its own context. Addresses are raw -- subtract the image base the
+  // loader printed at startup.
+  {
+    unsigned long long fp = c->x[29];
+    fprintf(stderr, "  guest call stack, innermost first:\n");
+    if (c->x[30]) fprintf(stderr, "    in   %#llx\n", (unsigned long long)c->x[30]);
+    for (int depth = 0; depth < 32; ++depth) {
+      MEMORY_BASIC_INFORMATION mbi;
+      if (!fp || (fp & 15)) break;
+      if (!VirtualQuery((void*)fp, &mbi, sizeof mbi)) break;
+      if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD)) break;
+      if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                           PAGE_EXECUTE_WRITECOPY))) break;
+      if (fp + 16 > (unsigned long long)mbi.BaseAddress + mbi.RegionSize) break;
+      unsigned long long next = 0, ret = 0;
+      memcpy(&next, (const void*)fp, sizeof next);
+      memcpy(&ret, (const void*)(fp + 8), sizeof ret);
+      if (!ret) break;
+      fprintf(stderr, "    from %#llx\n", ret);
+      if (next <= fp) break;
+      fp = next;
+    }
+  }
+  fprintf(stderr, "  guest registers:\n");
+  for (int i = 0; i < 31; i += 4) {
+    fprintf(stderr, "   ");
+    for (int j = i; j < i + 4 && j < 31; ++j)
+      fprintf(stderr, "  x%-2d=%016llx", j, (unsigned long long)c->x[j]);
+    fprintf(stderr, "\n");
+  }
+  fprintf(stderr, "     sp =%016llx\n", (unsigned long long)c->sp);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
+// Kept free of C++ objects: MSVC will not put structured exception handling in
+// a frame that also needs unwinding.
+void GuestThreadBody(uint64_t entry, Arm64Ctx* ctx, unsigned id) {
+#if defined(_WIN32)
+  __try {
+    arc_dispatch(ctx, entry);
+  } __except (GuestThreadFault(GetExceptionInformation(), ctx, id)) {
+  }
+#else
+  (void)id;
+  arc_dispatch(ctx, entry);
+#endif
+}
+
+// A guest stack, sixteen megabytes of address space and almost none of it
+// real.
+//
+// This was a std::vector, whose constructor zeroes what it allocates -- so
+// every guest thread touched all sixteen megabytes before running an
+// instruction, and every page of it was resident for the life of the thread.
+// A title that leaks threads then leaks *memory* at sixteen megabytes a go,
+// and what should have been a wasted handle becomes a machine that stops
+// responding. Demand-zero instead: the pages arrive as the guest stack is
+// actually used, which for most threads is a few kilobytes, and the size can
+// stay generous because it costs nothing to promise it.
+void* AllocGuestStack(size_t size) {
+#if defined(_WIN32)
+  return VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+  // calloc, not malloc+memset: for a block this size it is a fresh mapping,
+  // which the kernel already guarantees zeroed without anyone writing to it.
+  return calloc(1, size);
+#endif
+}
+
+void FreeGuestStack(void* p) {
+#if defined(_WIN32)
+  if (p) VirtualFree(p, 0, MEM_RELEASE);
+#else
+  free(p);
+#endif
+}
+
+void RunGuestThread(GuestThreadStart* s) {
+  t_self_id = s->id;
+  ++g_live_threads;
+  void* stack = AllocGuestStack(kGuestThreadStack);
+  Arm64Ctx ctx;
+  memset(&ctx, 0, sizeof(ctx));
+  ctx.sp = (reinterpret_cast<uint64_t>(stack) + kGuestThreadStack -
+            kGuestThreadHeadroom) & ~15ULL;
+  ctx.x[0] = s->arg;
+  {std::lock_guard<std::mutex> lock(g_active_lock);g_active[s->id]=&ctx;}
+  GuestThreadBody(s->entry, &ctx, s->id);
+  {std::lock_guard<std::mutex> lock(g_active_lock);g_active.erase(s->id);}
+  s->slot->result = reinterpret_cast<void*>(ctx.x[0]);
+  FreeGuestStack(stack);
+  --g_live_threads;
+  delete s;
+}
+
+#if defined(_WIN32)
+unsigned long __stdcall GuestThreadMain(void* p) {
+  RunGuestThread(static_cast<GuestThreadStart*>(p));
+  return 0;
+}
+#else
+void* GuestThreadMain(void* p) {
+  RunGuestThread(static_cast<GuestThreadStart*>(p));
+  return nullptr;
+}
+#endif
+
+// Which guest function each thread was started on, and how many there are so
+// far. A title that leaks threads looks from outside like a title that leaks
+// memory -- every thread carries a stack -- and the two have very different
+// fixes. ARC_TRACE_THREADS=1; the address is an image offset, so it names a
+// function in the same terms as every other trace here.
+void TraceCreate(uint64_t start) {
+  static const bool on = getenv("ARC_TRACE_THREADS") != nullptr;
+  const long n = ++g_threads_made;
+  if (!on) return;
+  fprintf(stderr, "[thread] #%ld start=%#llx from", n,
+          (unsigned long long)start);
+  // Who asked. "A title makes threads it never stops" is a symptom; the
+  // function doing the asking is the cause, and the frame ring already knows
+  // it -- printed as image offsets, the same currency as every other trace.
+  const size_t frames = arc_frame_count();
+  for (size_t i = 0; i < frames && i < 8; ++i) {
+    const unsigned long long packed = arc_frame_at(i);
+    fprintf(stderr, " %llx", packed & 0x00FFFFFFFFFFFFFFull);
+  }
+  fputc('\n', stderr);
+}
+
+int Create(uint64_t* out, const void*, uint64_t start, uint64_t arg) {
+  TraceCreate(start);
+  if (g_live_threads.load() >= GuestThreadCeiling()) {
+    // Said once. The caller retries, and a line per retry buries whatever the
+    // run was actually about.
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true)) {
+      // How fast, not just how many. A rate near the frame rate says the
+      // caller is doing this once per frame, which is a different bug from
+      // one that does it once per request or once per retry -- and it is the
+      // first thing worth knowing about a runaway.
+      const double secs = std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - g_first_thread)
+                              .count();
+      fprintf(stderr,
+              "\n%ld guest threads are alive and none are finishing -- "
+              "refusing to make more.\n%.0f started in %.1f seconds (%.0f a "
+              "second).\nRun with ARC_TRACE_THREADS=1 to see which function "
+              "is asking, or raise ARC_MAX_THREADS.\n",
+              g_live_threads.load(), (double)g_threads_made.load(), secs,
+              secs > 0 ? g_threads_made.load() / secs : 0.0);
+    }
+    return 11 /* EAGAIN */;
+  }
+  uint32_t id = 0;
+  Thread* t = g_threads.Obtain(&id);
+  if (!t) return 11 /* EAGAIN */;
+
+  auto* s = new GuestThreadStart{start, arg, id, t};
+#if defined(_WIN32)
+  // STACK_SIZE_PARAM_IS_A_RESERVATION, and it is not optional. Without the
+  // flag CreateThread reads its size argument as how much to *commit*, so a
+  // quarter-gigabyte stack is a quarter-gigabyte of real memory per thread
+  // before the thread has run an instruction. A title with a thread pool
+  // reaches ten gigabytes in seconds and dies -- with no fault, no message,
+  // and an exit code that reads like anything else. Reserved, the address
+  // space is there for a deep guest call chain and the pages arrive as the
+  // stack is actually used.
+  t->handle = CreateThread(nullptr, kHostThreadStack, GuestThreadMain, s,
+                           STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+  if (!t->handle) {
+    delete s;
+    return 11;
+  }
+#else
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, kHostThreadStack);
+  if (pthread_create(&t->handle, &attr, GuestThreadMain, s) != 0) {
+    pthread_attr_destroy(&attr);
+    delete s;
+    return 11;
+  }
+  pthread_attr_destroy(&attr);
+  t->started = true;
+#endif
+  *out = id;
+  return 0;
+}
+
+int Join(uint64_t id, void** result) {
+  Thread* t = g_threads.Find(static_cast<uint32_t>(id));
+  if (!t) return 3 /* ESRCH */;
+#if defined(_WIN32)
+  if (t->handle) {
+    WaitForSingleObject(t->handle, INFINITE);
+    CloseHandle(t->handle);
+    t->handle = nullptr;
+  }
+#else
+  if (t->started && !t->detached) {
+    pthread_join(t->handle, nullptr);
+    t->started = false;
+  }
+#endif
+  if (result) *result = t->result;
+  return 0;
+}
+
+int Detach(uint64_t id) {
+  Thread* t = g_threads.Find(static_cast<uint32_t>(id));
+  if (!t) return 3;
+  t->detached = true;
+#if defined(_WIN32)
+  if (t->handle) {
+    CloseHandle(t->handle);
+    t->handle = nullptr;
+  }
+#else
+  if (t->started) {
+    pthread_detach(t->handle);
+    t->started = false;
+  }
+#endif
+  return 0;
+}
+
+uint64_t Self() { return t_self_id; }
+int Equal(uint64_t a, uint64_t b) { return a == b; }
+int Kill(uint64_t, int) { return 0; }
+int Setname(uint64_t, const char*) { return 0; }
+int Setschedparam(uint64_t, int, const void*) { return 0; }
+
+// pthread_exit unwinds the calling thread. There is no portable way to do that
+// from inside a std::thread body, and the engine only reaches it on paths it
+// treats as terminal, so this is deliberately a hard stop rather than a
+// silently wrong return.
+[[noreturn]] void Exit(void*) {
+  fprintf(stderr, "pthread_exit called -- not implemented\n");
+  abort();
+}
+
+int AttrInit(uint32_t* a) {
+  *a = 0;
+  g_attrs.Obtain(a);
+  return 0;
+}
+int AttrDestroy(uint32_t* a) {
+  g_attrs.Release(a);
+  return 0;
+}
+int AttrSetdetachstate(uint32_t* a, int state) {
+  if (auto* p = g_attrs.Obtain(a)) p->detach_state = state;
+  return 0;
+}
+int AttrSetstacksize(uint32_t* a, size_t size) {
+  if (auto* p = g_attrs.Obtain(a)) p->stack_size = size;
+  return 0;
+}
+int AttrSetschedparam(uint32_t*, const void*) { return 0; }
+int AttrSetschedpolicy(uint32_t*, int) { return 0; }
+
+int SemInit(uint32_t* s, int, unsigned value) {
+  *s = 0;
+  if (auto* p = g_semaphores.Obtain(s)) p->count = value;
+  return 0;
+}
+int SemDestroy(uint32_t* s) {
+  g_semaphores.Release(s);
+  return 0;
+}
+int SemPost(uint32_t* s) {
+  if (auto* p = g_semaphores.Obtain(s)) {
+    std::lock_guard<std::mutex> g(p->m);
+    ++p->count;
+    p->cv.notify_one();
+  }
+  return 0;
+}
+int SemWait(uint32_t* s) {
+  if (auto* p = g_semaphores.Obtain(s)) {
+    std::unique_lock<std::mutex> lk(p->m);
+    p->cv.wait(lk, [p] { return p->count > 0; });
+    --p->count;
+  }
+  return 0;
+}
+int SemTrywait(uint32_t* s) {
+  auto* p = g_semaphores.Obtain(s);
+  if (!p) return 22;
+  std::lock_guard<std::mutex> g(p->m);
+  if (p->count == 0) return 11 /* EAGAIN */;
+  --p->count;
+  return 0;
+}
+
+int SchedYield() {
+  std::this_thread::yield();
+  return 0;
+}
+int SchedGetPriorityMin(int) { return 0; }
+
+struct Entry {
+  const char* name;
+  void* fn;
+};
+
+#define E(sym, fn) {sym, reinterpret_cast<void*>(&fn)}
+const Entry kTable[] = {
+    E("pthread_mutex_init", MutexInit),
+    E("pthread_mutex_destroy", MutexDestroy),
+    E("pthread_mutex_lock", MutexLock),
+    E("pthread_mutex_unlock", MutexUnlock),
+    E("pthread_mutex_trylock", MutexTrylock),
+    E("pthread_mutexattr_init", MutexattrInit),
+    E("pthread_mutexattr_destroy", MutexattrDestroy),
+    E("pthread_mutexattr_settype", MutexattrSettype),
+    E("pthread_cond_init", CondInit),
+    E("pthread_cond_destroy", CondDestroy),
+    E("pthread_cond_signal", CondSignal),
+    E("pthread_cond_broadcast", CondBroadcast),
+    E("pthread_cond_wait", CondWait),
+    E("pthread_cond_timedwait", CondTimedwait),
+    E("pthread_rwlock_init", RwlockInit),
+    E("pthread_rwlock_destroy", RwlockDestroy),
+    E("pthread_rwlock_rdlock", RwlockRdlock),
+    E("pthread_rwlock_wrlock", RwlockWrlock),
+    E("pthread_rwlock_unlock", RwlockUnlock),
+    E("pthread_once", Once),
+    E("pthread_key_create", KeyCreate),
+    E("pthread_attr_getdetachstate", AttrGetdetachstate),
+    E("pthread_key_delete", KeyDelete),
+    E("pthread_getspecific", Getspecific),
+    E("pthread_setspecific", Setspecific),
+    E("pthread_create", Create),
+    E("pthread_join", Join),
+    E("pthread_detach", Detach),
+    E("pthread_self", Self),
+    E("pthread_equal", Equal),
+    E("pthread_kill", Kill),
+    E("pthread_exit", Exit),
+    E("pthread_setname_np", Setname),
+    E("pthread_setschedparam", Setschedparam),
+    E("pthread_attr_init", AttrInit),
+    E("pthread_attr_destroy", AttrDestroy),
+    E("pthread_attr_setdetachstate", AttrSetdetachstate),
+    E("pthread_attr_setstacksize", AttrSetstacksize),
+    E("pthread_attr_setschedparam", AttrSetschedparam),
+    E("pthread_attr_setschedpolicy", AttrSetschedpolicy),
+    E("sem_init", SemInit),
+    E("sem_destroy", SemDestroy),
+    E("sem_post", SemPost),
+    E("sem_wait", SemWait),
+    E("sem_trywait", SemTrywait),
+    E("sched_yield", SchedYield),
+    E("sched_get_priority_min", SchedGetPriorityMin),
+};
+#undef E
+
+}  // namespace
+
+uint64_t ShimResolvePthread(const char* name) {
+  for (const Entry& e : kTable)
+    if (strcmp(e.name, name) == 0) return reinterpret_cast<uint64_t>(e.fn);
+  return 0;
+}
+
+size_t ShimPthreadCount() { return sizeof(kTable) / sizeof(kTable[0]); }
+
+void ShimDumpGuestThreads(uint64_t base){
+  std::lock_guard<std::mutex> lock(g_active_lock);
+  fprintf(stderr,"[bsm threads] %zu active\n",g_active.size());
+  for(auto& entry:g_active){auto c=entry.second;fprintf(stderr,"  thread %u x30 +%llx stack",entry.first,(unsigned long long)(c->x[30]-base));uint64_t fp=c->x[29];
+#if defined(_WIN32)
+    for(int depth=0;depth<12&&fp&&!(fp&15);++depth){MEMORY_BASIC_INFORMATION m{};if(!VirtualQuery((void*)fp,&m,sizeof(m))||m.State!=MEM_COMMIT||(m.Protect&PAGE_GUARD)||fp+16>(uint64_t)m.BaseAddress+m.RegionSize)break;uint64_t next=0,ret=0;memcpy(&next,(void*)fp,8);memcpy(&ret,(void*)(fp+8),8);fprintf(stderr," +%llx",(unsigned long long)(ret-base));if(next<=fp)break;fp=next;}
+#endif
+    fprintf(stderr,"\n");
+  }
+}
+
+}  // namespace arc
