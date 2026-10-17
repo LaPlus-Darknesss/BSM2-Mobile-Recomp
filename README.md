@@ -4,6 +4,8 @@ I put this together to get the Android version of Bloons Supermonkey 2 running o
 
 Keep in mind that this is still an early release candidate. The menu, map, lab, first-level gameplay and saving have been checked, however, I have not finished a full playthrough or tested every weapon and power. If you run into something that looks wrong, please include what you were using and where it happened.
 
+The latest repair handles a missing online settings document during profile submission, which was causing a captured post-level crash. It takes the original game's existing upload-interval fallback and keeps local saving unchanged. The updated build reaches the title screen and exits normally; confirmation of the reported gameplay transition is still pending. Exception reports now retain the original call stack, and the launcher writes complete logs before showing its error prompt. If another crash happens, please send both session files from `Logs` after closing that prompt.
+
 ## Getting it running
 
 You need your own Android 1.10 game files. This repository includes the runtime adapters, translation tools and build instructions, but does not include the APK, game assets, original engine, generated game code or a prebuilt game executable. The importer checks the exact arm64 engine version before generating anything.

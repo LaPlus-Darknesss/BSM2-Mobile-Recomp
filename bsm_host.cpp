@@ -883,6 +883,8 @@ std::string FaultWhat(unsigned long code) {
 
 }  // namespace
 
+void BsmDiagnosticStack(const Arm64Ctx* c) { ReportGuestStack(c); }
+
 #if defined(_WIN32)
 // Bionic returns an error from a bad argument; the UCRT calls __fastfail, and
 // __fastfail is not an exception -- no handler sees it, the process is gone,

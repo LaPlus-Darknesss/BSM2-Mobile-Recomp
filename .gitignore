@@ -18,6 +18,7 @@
 !relift_functions.py
 !limit_optimizer.py
 !install_cursor_hook.py
+!install_config_hook.py
 !docs/
 !docs/*.md
 !tools/

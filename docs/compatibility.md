@@ -17,6 +17,7 @@ These are the shared differences that have been repaired so far:
 | Floating-point calls | Math imports use the ARM64 floating-point registers. Android binary128 parser results are encoded for the guest rather than returned as a Windows `long double`. |
 | Files and structures | Binary file mode, Linux open flags, directory entries and arm64 file metadata use explicit adapters. These were already present and were reviewed again. |
 | Graphics and input | The game keeps its original vertex attribute indices and render-thread context handling. The window is fixed at 540 by 960 logical window pixels, with the desktop cursor adapter mapping into the playfield. |
+| Optional upload settings | When the online settings document is absent or is not an object, the profile upload interval accessor takes its existing native 900,000 ms fallback and cleanup directly. Valid settings keep the original lookup. This repairs a captured post-level exception path without changing local saves or stage data; playthrough confirmation is pending. |
 
 The compatibility fixtures cover published RNG sequences, distribution and radial spread, host floating-point calls, text and numeric ABI cases, large file offsets, file replacement, the fixed-window settings, cursor mapping and independent audio callbacks. Fresh generation from the supplied matching APKM produced the same 25,861 function bodies as the working local translation, with no missing or duplicate definitions. The clean CMake configuration also passed. That comparison is not a second full compilation of all generated files.
 
@@ -29,6 +30,7 @@ This is a release candidate, so I am keeping the remaining limits visible:
 - Locale handling is limited. The UTF-8 and UTF-32 checks do not establish every language, locale rule or text layout.
 - Rare scan formats involving wide strings or binary128 floating-point destinations, and full binary128 precision, remain limited. Ordinary asset/gameplay parsing has been smoke checked, but that does not cover every C library format.
 - Process creation, signals and networking are partial. The local game should not be treated as having working Android services behind those interfaces.
+- Guest C++ exception unwinding is incomplete. I captured a missing online-settings exception failing before its native catch block. The optional upload-setting path now checks for that case directly; this does not establish that other exception paths work.
 - Thread adapters preserve the interfaces used in the checked runs, however, not every POSIX scheduling, cleanup or synchronization feature is implemented.
 - Window resizing is disabled. Fullscreen, stretching and moving between displays with different scaling settings have not been accepted.
 - Local save writes and reloads have been checked. Exact mid-level resume and recovery from an interrupted write need more testing.

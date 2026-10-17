@@ -5,6 +5,22 @@ ENGINE=OUT/'run/libnative.so'
 def install():
     expected='1b3e1e45589c10945a5941949552136647c40842cd96d437fd96dfce2a4387b9'
     if hashlib.sha256(ENGINE.read_bytes()).hexdigest()!=expected:raise RuntimeError('Cursor adapter requires the pinned Android 1.10 engine')
+    from install_config_hook import install as install_config
+    install_config()
+    probe=OUT/'generated/lifted_043.c'
+    diagnostic=probe.read_text()
+    entry='void fn0_aa2728(Arm64Ctx* c) {'
+    if 'BsmTraceThrow(c);' not in diagnostic:
+        if diagnostic.count(entry)!=1:raise RuntimeError('Pinned exception entry is missing')
+        diagnostic=diagnostic.replace('#include "lifted.h"\n','#include "lifted.h"\nvoid BsmTraceThrow(Arm64Ctx* c);\n',1).replace(entry,entry+'\n  BsmTraceThrow(c);',1)
+        probe.write_text(diagnostic)
+    probe=OUT/'generated/lifted_047.c'
+    diagnostic=probe.read_text()
+    entry='L_390a08:;'
+    if 'BsmTraceJsonType(c);' not in diagnostic:
+        if diagnostic.count(entry)!=1:raise RuntimeError('Pinned JSON mismatch branch is missing')
+        diagnostic=diagnostic.replace('#include "lifted.h"\n','#include "lifted.h"\nvoid BsmTraceJsonType(Arm64Ctx* c);\n',1).replace(entry,entry+'\n  BsmTraceJsonType(c);',1)
+        probe.write_text(diagnostic)
     source=OUT/'generated/lifted_059.c'
     text=source.read_text()
     declaration='void BsmCursorTarget(Arm64Ctx* c);\n'

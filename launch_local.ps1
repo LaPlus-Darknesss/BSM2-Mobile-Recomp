@@ -40,14 +40,19 @@ try {
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
-    $outputStream = [IO.File]::Create($log)
-    $errorStream = [IO.File]::Create((Join-Path $logRoot ($stamp + '.errors.log')))
+    # Disable FileStream buffering as well as the game's own stdio buffering.
+    # Reports should remain complete even if this console is closed at a prompt.
+    $outputStream = [IO.FileStream]::new($log, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read, 1, [IO.FileOptions]::WriteThrough)
+    $errorStream = [IO.FileStream]::new((Join-Path $logRoot ($stamp + '.errors.log')), [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read, 1, [IO.FileOptions]::WriteThrough)
     $process = [Diagnostics.Process]::Start($start)
     $outputCopy = $process.StandardOutput.BaseStream.CopyToAsync($outputStream)
     $errorCopy = $process.StandardError.BaseStream.CopyToAsync($errorStream)
     $process.WaitForExit()
     $outputCopy.Wait()
     $errorCopy.Wait()
+    # Keep the complete failure report on disk before the error prompt waits.
+    $outputStream.Flush()
+    $errorStream.Flush()
     if ($process.ExitCode) { throw "Game stopped with code $($process.ExitCode). Details: $log" }
 } catch {
     Write-Host $_.Exception.Message
